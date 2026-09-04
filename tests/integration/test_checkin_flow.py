@@ -4,8 +4,9 @@
 注意：这些测试需要真实的浏览器环境或更完善的 mock
 目前作为示例框架，实际测试需要根据具体情况调整
 """
+from unittest.mock import AsyncMock, Mock, patch
+
 import pytest
-from unittest.mock import Mock, AsyncMock, patch
 
 
 class TestCheckinFlow:
@@ -14,7 +15,9 @@ class TestCheckinFlow:
     @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.slow
-    async def test_cookies_checkin_flow(self, sample_account_config, sample_provider_config):
+    async def test_cookies_checkin_flow(
+        self, tmp_path, sample_account_config, sample_provider_config
+    ):
         """测试 Cookies 认证签到完整流程"""
         from checkin import CheckIn
 
@@ -29,6 +32,37 @@ class TestCheckinFlow:
             mock_context.new_page = AsyncMock(return_value=mock_page)
             mock_context.cookies = AsyncMock(return_value=[
                 {"name": "session", "value": "test_session"}
+            ])
+            mock_page.url = "https://test.example.com/panel"
+            mock_page.content = AsyncMock(return_value="<html><body>panel</body></html>")
+            mock_page.title = AsyncMock(return_value="Test Panel")
+            mock_page.is_closed = Mock(return_value=False)
+            mock_page.close = AsyncMock()
+            mock_page.evaluate = AsyncMock(side_effect=[
+                {
+                    "status": 200,
+                    "ok": True,
+                    "contentType": "application/json",
+                    "data": {
+                        "success": True,
+                        "data": {"id": "12345", "username": "test_user"},
+                    },
+                },
+                {
+                    "status": 200,
+                    "ok": True,
+                    "contentType": "application/json",
+                    "data": {"success": True, "message": "签到成功"},
+                },
+                {
+                    "status": 200,
+                    "ok": True,
+                    "contentType": "application/json",
+                    "data": {
+                        "success": True,
+                        "data": {"quota": 1000000, "used_quota": 500000},
+                    },
+                },
             ])
 
             # Mock httpx 响应
@@ -57,6 +91,7 @@ class TestCheckinFlow:
                 mock_http.get = AsyncMock(return_value=mock_user_response)
 
                 checkin = CheckIn(sample_account_config, sample_provider_config)
+                checkin.balance_data_file = str(tmp_path / "balance_data.json")
                 checkin._playwright = mock_browser
 
                 results = await checkin.execute()

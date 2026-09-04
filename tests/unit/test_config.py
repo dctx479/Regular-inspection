@@ -1,15 +1,8 @@
 """
 配置模块单元测试
 """
-import pytest
-import os
-from utils.config import (
-    validate_password_strength,
-    AccountConfig,
-    ProviderConfig,
-    AuthConfig
-)
 from utils.auth_method import AuthMethod
+from utils.config import AccountConfig, ProviderConfig, validate_password_strength
 
 
 class TestPasswordValidation:
@@ -23,7 +16,7 @@ class TestPasswordValidation:
 
     def test_valid_password_medium(self):
         """测试中等强度密码"""
-        is_valid, error = validate_password_strength("password123", "test", 0)
+        is_valid, error = validate_password_strength("MediumPass123", "test", 0)
         assert is_valid is True
         assert error is None
 
@@ -41,13 +34,13 @@ class TestPasswordValidation:
 
     def test_invalid_password_repeated_chars(self):
         """测试重复字符密码"""
-        is_valid, error = validate_password_strength("111111", "test", 0)
+        is_valid, error = validate_password_strength("aaaaaa", "test", 0)
         assert is_valid is False
         assert "重复字符" in error
 
     def test_invalid_password_consecutive_chars(self):
         """测试连续字符密码"""
-        is_valid, error = validate_password_strength("123456", "test", 0)
+        is_valid, error = validate_password_strength("abcdef", "test", 0)
         assert is_valid is False
         assert "连续字符" in error
 
@@ -95,6 +88,21 @@ class TestAccountConfig:
         assert config.auth_configs[0].method == AuthMethod.EMAIL
         assert config.auth_configs[0].username == "test@example.com"
         assert config.auth_configs[0].password == "password123"
+
+    def test_from_dict_email_api_user(self):
+        """Email 配置应保留显式站内用户 ID。"""
+        data = {
+            "name": "Email Account",
+            "provider": "anyrouter",
+            "email": {
+                "username": "test@example.com",
+                "password": "StrongP@ss1",
+                "api_user": "12345",
+            },
+        }
+        config = AccountConfig.from_dict(data, 0)
+
+        assert config.auth_configs[0].api_user == "12345"
 
     def test_from_dict_multiple_auth(self):
         """测试从字典创建多种认证方式配置"""

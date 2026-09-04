@@ -5,8 +5,8 @@ CI 环境人类行为模拟功能验证脚本
 """
 
 import asyncio
-import sys
 import os
+import sys
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,7 +46,6 @@ def test_ci_config():
     logger.info(f"是否使用延长等待: {extended_wait}")
 
     logger.info("")
-    return True
 
 
 async def test_human_behavior_import():
@@ -57,6 +56,17 @@ async def test_human_behavior_import():
 
     try:
         from utils.human_behavior import (
+            add_random_mouse_jitter,
+            simulate_click_with_behavior,
+            simulate_form_filling,
+            simulate_human_behavior,
+            simulate_mouse_movement_to_element,
+            simulate_page_interaction,
+            simulate_reading_delay,
+            simulate_typing,
+        )
+
+        imported_functions = (
             simulate_human_behavior,
             simulate_page_interaction,
             simulate_typing,
@@ -66,6 +76,7 @@ async def test_human_behavior_import():
             simulate_form_filling,
             add_random_mouse_jitter,
         )
+        assert all(callable(function) for function in imported_functions)
 
         logger.info("✅ 所有函数导入成功:")
         logger.info("   - simulate_human_behavior")
@@ -78,12 +89,12 @@ async def test_human_behavior_import():
         logger.info("   - add_random_mouse_jitter")
 
         logger.info("")
-        return True
+        return None
 
     except ImportError as e:
         logger.error(f"❌ 导入失败: {e}")
         logger.info("")
-        return False
+        raise
 
 
 def test_authenticator_integration():
@@ -93,9 +104,9 @@ def test_authenticator_integration():
     logger.info("=" * 60)
 
     try:
-        from utils.auth.base import Authenticator
-        from utils.config import AuthConfig, ProviderConfig
         import inspect
+
+        from utils.auth.base import Authenticator
 
         # 检查基类是否有新增的方法
         methods_to_check = [
@@ -121,14 +132,14 @@ def test_authenticator_integration():
         logger.info(f"   参数: {list(init_signature.parameters.keys())}")
 
         logger.info("")
-        return all_methods_exist
+        assert all_methods_exist
 
     except Exception as e:
         logger.error(f"❌ 集成测试失败: {e}")
         import traceback
         traceback.print_exc()
         logger.info("")
-        return False
+        raise
 
 
 def test_environment_variables():
@@ -186,7 +197,7 @@ def test_environment_variables():
             del os.environ[var]
 
     logger.info("")
-    return success
+    assert success
 
 
 def main():
@@ -195,12 +206,19 @@ def main():
     logger.info("🚀 开始验证 CI 环境人类行为模拟功能")
     logger.info("")
 
-    results = {
-        "CI 配置功能": test_ci_config(),
-        "行为模拟模块导入": asyncio.run(test_human_behavior_import()),
-        "Authenticator 集成": test_authenticator_integration(),
-        "环境变量配置": test_environment_variables(),
-    }
+    results = {}
+    try:
+        test_ci_config()
+        results["CI 配置功能"] = True
+        asyncio.run(test_human_behavior_import())
+        results["行为模拟模块导入"] = True
+        test_authenticator_integration()
+        results["Authenticator 集成"] = True
+        test_environment_variables()
+        results["环境变量配置"] = True
+    except Exception:
+        # 具体失败已由各测试函数记录。
+        results.setdefault("测试执行", False)
 
     # 汇总结果
     logger.info("=" * 60)

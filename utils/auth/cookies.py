@@ -3,8 +3,9 @@ Cookies 认证器 - 使用预设的 Cookies 进行认证
 """
 
 import asyncio
-from typing import Dict, Any, Tuple, Optional
-from playwright.async_api import Page, BrowserContext
+from typing import Any, Dict, Optional, Tuple
+
+from playwright.async_api import BrowserContext, Page
 
 from utils.auth.base import Authenticator, logger
 from utils.sanitizer import sanitize_exception
@@ -27,266 +28,101 @@ class CookiesAuthenticator(Authenticator):
                 (是否有效, 用户ID, 用户名, 错误信息)
         """
         try:
-            # 步骤0: 等待 cookies 完全应用
             logger.info(f"🔍 [{self.account_name}] 等待 Cookies 应用到浏览器上下文...")
             await asyncio.sleep(1)
 
-            # 步骤1: 访问用户中心或主页（而非登录页），检查是否自动跳转
+            # 页面能返回 200 只代表 SPA 外壳可访问，不能作为认证依据。
             logger.info(f"🔍 [{self.account_name}] 步骤1: 访问用户中心验证 Cookies...")
-            try:
-                # 优先访问用户中心或仪表板页面
-                test_urls = [
-                    f"{self.provider_config.base_url}/panel",
-                    f"{self.provider_config.base_url}/dashboard",
-                    f"{self.provider_config.base_url}/",
-                ]
+            test_urls = [
+                f"{self.provider_config.base_url}/panel",
+                f"{self.provider_config.base_url}/dashboard",
+                f"{self.provider_config.base_url}/",
+            ]
+            navigation_success = False
+            for test_url in test_urls:
+                try:
+                    await page.goto(test_url, wait_until="domcontentloaded", timeout=20000)
+                    navigation_success = True
+                    logger.info(f"✅ [{self.account_name}] 成功访问: {test_url}")
+                    break
+                except Exception as nav_error:
+                    logger.debug(f"⚠️ [{self.account_name}] 访问 {test_url} 失败: {nav_error}")
 
-                navigation_success = False
-                for test_url in test_urls:
-                    try:
-                        await page.goto(
-                            test_url,
-                            wait_until="domcontentloaded",
-                            timeout=20000
-                        )
-                        navigation_success = True
-                        logger.info(f"✅ [{self.account_name}] 成功访问: {test_url}")
-                        break
-                    except Exception as nav_error:
-                        logger.debug(f"⚠️ [{self.account_name}] 访问 {test_url} 失败: {nav_error}")
-                        continue
+            if not navigation_success:
+                return False, None, None, "Unable to navigate to any test URL"
 
-                if not navigation_success:
-                    logger.warning(f"⚠️ [{self.account_name}] 所有测试 URL 都无法访问")
-                    return False, None, None, "Unable to navigate to any test URL"
-
-            except Exception as nav_error:
-                logger.warning(f"⚠️ [{self.account_name}] 导航失败: {nav_error}")
-                return False, None, None, f"Navigation error: {nav_error}"
-
-            await asyncio.sleep(2)  # 等待页面加载完成
-
-            # 获取页面内容
+            await asyncio.sleep(2)
             page_content = await page.content()
             current_url = page.url
 
-            # 步骤2: 检测 Cloudflare 拦截特征
+            # 检查 WAF 挑战，但挑战通过后仍必须进行 API 认证验证。
             cf_indicators = [
-                'Checking your browser',
-                'Just a moment',
-                'cf-challenge',
-                'challenge-platform',
-                'cloudflare',
-                'ddos protection'
+                "checking your browser",
+                "just a moment",
+                "cf-challenge",
+                "challenge-platform",
+                "cloudflare",
+                "ddos protection",
             ]
-
-            has_cf_challenge = any(
-                indicator.lower() in page_content.lower()
-                for indicator in cf_indicators
-            )
-
-            if has_cf_challenge:
+            if any(indicator in page_content.lower() for indicator in cf_indicators):
                 logger.warning(f"⚠️ [{self.account_name}] 检测到 Cloudflare 拦截，等待验证完成...")
-
-                # 等待 Cloudflare 验证完成（最多15秒）
-                verification_passed = await self._wait_for_cloudflare_bypass(page, max_wait=15)
-
-                if not verification_passed:
+                if not await self._wait_for_cloudflare_bypass(page, max_wait=15):
                     return False, None, None, "Cloudflare challenge not passed"
 
-                # 重新获取页面内容
-                page_content = await page.content()
                 current_url = page.url
 
-            # 步骤3: 检查是否被重定向到登录页（说明 cookies 可能失效）
-            # 注意：只有当明确在登录页且有登录表单时才判定为失效
-            if '/login' in current_url.lower():
-                has_login_form = any(
-                    keyword in page_content.lower()
-                    for keyword in ['<input', 'type="email"', 'type="password"', 'form']
-                )
-                if has_login_form:
-                    logger.warning(f"⚠️ [{self.account_name}] 被重定向到登录页，Cookies 可能已失效")
-                    # 不立即返回失败，继续尝试 API 验证
-                    logger.info(f"🔍 [{self.account_name}] 继续尝试通过 API 验证...")
-                else:
-                    logger.info(f"ℹ️ [{self.account_name}] URL 包含 login 但未检测到登录表单，可能是其他页面")
+            if "/login" in current_url.lower():
+                logger.warning(f"⚠️ [{self.account_name}] 被重定向到登录页，Cookies 可能已失效")
 
-            # 步骤4: 尝试在浏览器中通过 API 验证 Cookies（使用 fetch，自动携带 cookies）
-            logger.info(f"🔍 [{self.account_name}] 步骤2: 通过浏览器 API 验证 Cookies...")
-
-            api_validation_success = False
-            api_user_id = None
-            api_username = None
-
-            try:
-                # 使用浏览器的 fetch API 来验证（自动携带 cookies）
-                user_info_url = self.provider_config.get_user_info_url()
-
-                # 获取 api_user（从配置或推断）
-                api_user = self.auth_config.api_user
-                if not api_user:
-                    # 尝试从账号名推断
-                    import re
-                    numbers = re.findall(r'\d+', self.account_name)
-                    api_user = numbers[0] if numbers else self.account_name
-
+            # 优先使用显式 api_user；只有名称末尾存在明确数字 ID 时才允许推断。
+            api_user = self.auth_config.api_user or self._infer_api_user(self.account_name)
+            if api_user:
                 logger.info(f"🔑 [{self.account_name}] 使用 API User: {api_user}")
+            else:
+                logger.warning(f"⚠️ [{self.account_name}] 未配置可靠的 API User，将尝试不带用户头验证")
 
-                # 构建请求参数
-                fetch_params = {
-                    "url": user_info_url,
-                    "apiUser": str(api_user)
-                }
+            logger.info(f"🔍 [{self.account_name}] 步骤2: 通过浏览器 API 验证 Cookies...")
+            validation = await self._validate_authenticated_session(page, context, api_user)
 
-                result = await page.evaluate("""
-                    async ({url, apiUser}) => {
-                        try {
-                            const response = await fetch(url, {
-                                method: 'GET',
-                                headers: {
-                                    'Accept': 'application/json',
-                                    'X-Requested-With': 'XMLHttpRequest',
-                                    'New-Api-User': apiUser
-                                },
-                                credentials: 'include'
-                            });
+            # 如果配置的 ID 不正确，但页面里能读到真实 ID，再用真实 ID 重试一次。
+            if not validation.get("success"):
+                logger.info(f"🔍 [{self.account_name}] API 首次验证失败，尝试从 localStorage 获取真实用户 ID...")
+                local_user_id, local_username = await self._extract_user_from_localstorage(page)
+                if local_user_id and str(local_user_id) != str(api_user or ""):
+                    validation = await self._validate_authenticated_session(
+                        page, context, local_user_id
+                    )
+                    if validation.get("success"):
+                        return (
+                            True,
+                            validation.get("user_id") or str(local_user_id),
+                            validation.get("username") or local_username,
+                            None,
+                        )
 
-                            const contentType = response.headers.get('content-type');
-                            let data;
-
-                            if (contentType && contentType.includes('application/json')) {
-                                data = await response.json();
-                            } else {
-                                data = await response.text();
-                            }
-
-                            return {
-                                status: response.status,
-                                ok: response.ok,
-                                contentType: contentType,
-                                data: data
-                            };
-                        } catch (error) {
-                            return {
-                                status: 0,
-                                ok: false,
-                                error: error.message
-                            };
-                        }
-                    }
-                """, fetch_params)
-
-                logger.info(f"📊 [{self.account_name}] 浏览器 API 响应状态: {result.get('status')}")
-
-                if result.get('error'):
-                    logger.warning(f"⚠️ [{self.account_name}] 浏览器 API 请求失败: {result['error']}")
-                elif result.get('status') == 401:
-                    logger.warning(f"⚠️ [{self.account_name}] API 返回 401，Cookies 可能已失效")
-                elif result.get('ok'):
-                    data = result.get('data')
-                    content_type = result.get('contentType', '')
-
-                    # 如果返回的是字符串（可能是 JSON 字符串）
-                    if isinstance(data, str):
-                        if 'application/json' in content_type:
-                            import json
-                            try:
-                                data = json.loads(data)
-                            except:
-                                logger.warning(f"⚠️ [{self.account_name}] JSON 解析失败")
-                                data = None
-                        else:
-                            logger.warning(f"⚠️ [{self.account_name}] API 返回非 JSON 内容: {content_type}")
-                            data = None
-
-                    # 解析用户数据
-                    if isinstance(data, dict):
-                        if data.get("success") and data.get("data"):
-                            user_data = data["data"]
-                            api_user_id = (
-                                user_data.get("id") or
-                                user_data.get("user_id") or
-                                user_data.get("userId")
-                            )
-                            api_username = (
-                                user_data.get("username") or
-                                user_data.get("name") or
-                                user_data.get("email")
-                            )
-
-                            if api_user_id or api_username:
-                                logger.info(
-                                    f"✅ [{self.account_name}] 浏览器 API 验证通过: "
-                                    f"ID={api_user_id}, 用户名={api_username}"
-                                )
-                                api_validation_success = True
-                            else:
-                                logger.warning(f"⚠️ [{self.account_name}] API 响应中未找到用户标识")
-                        elif not data.get("success"):
-                            logger.warning(f"⚠️ [{self.account_name}] API 响应 success=false: {data.get('message', 'Unknown')}")
-                        else:
-                            logger.warning(f"⚠️ [{self.account_name}] API 响应格式异常")
-                else:
-                    logger.warning(f"⚠️ [{self.account_name}] API 返回异常状态码: {result.get('status')}")
-
-            except Exception as api_error:
-                logger.warning(f"⚠️ [{self.account_name}] 浏览器 API 请求异常: {api_error}")
-
-            # 如果 API 验证成功，直接返回
-            if api_validation_success:
-                return True, str(api_user_id) if api_user_id else None, api_username, None
-
-            # 步骤5: API 失败，尝试从页面提取用户信息（作为最后的后备方案）
-            logger.info(f"🔍 [{self.account_name}] 步骤3: 从页面提取用户信息作为后备方案...")
-
-            # 先尝试从 localStorage 提取（更可靠）
-            user_id, username = await self._extract_user_from_localstorage(page)
-
-            if not (user_id or username):
-                # localStorage 失败，尝试从页面 URL/元素提取
-                user_id, username = await self._extract_user_from_page(page)
-
-            if user_id or username:
+            if validation.get("success"):
                 logger.info(
-                    f"✅ [{self.account_name}] 从页面提取到用户信息: "
-                    f"ID={user_id}, 用户名={username}"
+                    f"✅ [{self.account_name}] 浏览器 API 验证通过: "
+                    f"ID={validation.get('user_id')}, 用户名={validation.get('username')}"
                 )
-                return True, user_id, username, None
-
-            # 步骤6: 如果完全无法验证，但页面不在登录页，则给予宽容判定
-            # 但要确保至少有一个标识（不能完全为 None）
-            if '/login' not in current_url.lower():
-                logger.warning(
-                    f"⚠️ [{self.account_name}] 无法通过 API 或页面提取验证用户信息，"
-                    f"但当前不在登录页（{current_url}），给予宽容判定"
+                return (
+                    True,
+                    validation.get("user_id"),
+                    validation.get("username"),
+                    None,
                 )
 
-                # 尝试从 cookies 中提取可能的用户标识
-                fallback_id = None
-                for cookie in await context.cookies():
-                    # 尝试从 cookie 名称中找到可能的用户 ID
-                    if 'user' in cookie['name'].lower() or 'id' in cookie['name'].lower():
-                        try:
-                            # 如果 cookie 值是数字，可能是用户 ID
-                            potential_id = str(cookie['value'])
-                            if potential_id.isdigit():
-                                fallback_id = potential_id
-                                logger.info(f"ℹ️ [{self.account_name}] 从 cookie '{cookie['name']}' 提取到可能的用户ID: {fallback_id}")
-                                break
-                        except:
-                            pass
+            error = validation.get("error") or "Cookies validation failed"
+            status = validation.get("status")
+            if status in (401, 403):
+                error = (
+                    f"认证 API 返回 HTTP {status}，Cookie 可能已过期、被撤销，"
+                    "或 api_user 与 Cookie 不匹配"
+                )
 
-                # 如果没有从 cookie 提取到 ID，使用账号名
-                if not fallback_id:
-                    fallback_id = self.account_name
-                    logger.info(f"ℹ️ [{self.account_name}] 使用账号名作为后备标识: {fallback_id}")
-
-                return True, fallback_id, None, None
-
-            # 完全无法验证
-            logger.error(f"❌ [{self.account_name}] 无法通过任何方式验证 Cookies，且页面在登录页")
-            return False, None, None, "Unable to validate cookies through any method and page is at login"
+            # 无论页面是否能打开，都不能以账号名作为用户 ID 放行。
+            logger.error(f"❌ [{self.account_name}] Cookies 预检未通过: {error}")
+            return False, None, None, error
 
         except Exception as e:
             logger.error(f"❌ [{self.account_name}] Cookies 预检异常: {e}")

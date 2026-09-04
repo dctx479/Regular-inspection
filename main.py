@@ -2,49 +2,48 @@
 """
 Router平台自动签到脚本 - 重构版
 支持 AnyRouter、AgentRouter 等多平台
-支持 Cookies、GitHub、Linux.do 等多种认证方式
+支持 Cookies、Email 等稳定认证方式
 """
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+import math
 import os
+import random
 import sys
 from datetime import datetime
-from typing import List, Dict, Optional
+from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
+
+# 必须在导入会读取环境变量的模块前加载 .env。
+# GitHub Actions 中变量已由 workflow 注入，本地运行则依赖此处加载。
+load_dotenv(override=True)
 
 from checkin import CheckIn
 from utils.config import AppConfig, load_accounts, validate_account
 from utils.notify import notify
 
-load_dotenv(override=True)
-
 BALANCE_HASH_FILE = "balance_hash.txt"
 
 
-def check_dependencies():
+async def check_dependencies():
     """检查必要的依赖是否已安装"""
     logger = logging.getLogger(__name__)
     missing_deps = []
 
-    try:
-        import playwright
-    except ImportError:
+    if importlib.util.find_spec("playwright") is None:
         missing_deps.append("playwright")
 
-    try:
-        import httpx
-    except ImportError:
+    if importlib.util.find_spec("httpx") is None:
         missing_deps.append("httpx")
 
-    try:
-        import pyotp
-    except ImportError:
+    if importlib.util.find_spec("pyotp") is None:
         # pyotp 是可选依赖（仅2FA需要）
         logger.info("ℹ️ pyotp 未安装（仅GitHub 2FA需要）")
 
@@ -53,17 +52,18 @@ def check_dependencies():
         logger.info("💡 请运行: pip install -r requirements.txt")
         sys.exit(1)
 
-    # 检查 Playwright 浏览器是否已安装
+    # 检查 Playwright 浏览器是否已安装。
+    # main() 本身运行在 asyncio loop 中，不能调用 Sync API。
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            try:
-                p.chromium.launch(headless=True, timeout=5000)
-            except Exception as browser_error:
-                if "Executable doesn't exist" in str(browser_error):
-                    logger.error("❌ Playwright 浏览器未安装")
-                    logger.info("💡 请运行: playwright install chromium")
-                    sys.exit(1)
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            executable_path = p.chromium.executable_path
+            browser_exists = await asyncio.to_thread(os.path.exists, executable_path)
+            if not browser_exists:
+                logger.error("❌ Playwright 浏览器未安装")
+                logger.info("💡 请运行: playwright install chromium")
+                sys.exit(1)
     except Exception as e:
         logger.warning(f"⚠️ 无法验证 Playwright 浏览器: {e}")
 
@@ -84,17 +84,28 @@ def validate_env_vars():
         missing_vars.append("账号配置环境变量")
         logger.error(f"❌ 缺少账号配置: 需要设置 {', '.join(account_vars)} 中的至少一个")
 
-    # 检查可选但建议的环境变量
-    optional_vars = {
-        "NOTIFY_PUSHPLUS_TOKEN": "PushPlus 推送通知",
-        "NOTIFY_DINGTALK_WEBHOOK": "钉钉webhook通知",
-        "NOTIFY_FEISHU_WEBHOOK": "飞书webhook通知",
-        "NOTIFY_WECHAT_WORK_WEBHOOK": "企业微信webhook通知",
+    # 检查可选但建议的环境变量。这里必须与 NotificationKit 和 workflow
+    # 使用的实际变量名一致，避免 SERVERPUSHKEY 已配置却被误报为空。
+    notification_vars = {
+        "SERVERPUSHKEY": "Server酱通知",
+        "PUSHPLUS_TOKEN": "PushPlus 推送通知",
+        "DINGDING_WEBHOOK": "钉钉webhook通知",
+        "FEISHU_WEBHOOK": "飞书webhook通知",
+        "WEIXIN_WEBHOOK": "企业微信webhook通知",
     }
 
-    has_notify = any(os.getenv(var) for var in optional_vars.keys())
+    email_vars = ("EMAIL_USER", "EMAIL_PASS", "EMAIL_TO")
+    has_email_notify = all(os.getenv(var) for var in email_vars)
+    has_partial_email = any(os.getenv(var) for var in email_vars)
+    has_other_notify = any(os.getenv(var) for var in notification_vars)
+    has_notify = has_email_notify or has_other_notify
     if not has_notify:
-        warnings.append("未配置任何通知方式，将无法接收签到结果通知")
+        if has_partial_email:
+            warnings.append("邮件通知配置不完整（需要同时设置 EMAIL_USER、EMAIL_PASS、EMAIL_TO）")
+        else:
+            warnings.append("未配置任何通知方式，将无法接收签到结果通知")
+    elif has_partial_email and not has_email_notify:
+        warnings.append("邮件通知配置不完整（需要同时设置 EMAIL_USER、EMAIL_PASS、EMAIL_TO）")
 
     # 输出验证结果
     if missing_vars:
@@ -115,6 +126,32 @@ def validate_env_vars():
     return True
 
 
+def get_account_delay_seconds() -> float:
+    """获取账号之间的随机等待时间。
+
+    默认等待 30–60 秒，降低连续登录触发目标站点 WAF/频率限制的概率。
+    可通过 ACCOUNT_DELAY_ENABLED、ACCOUNT_DELAY_MIN_SECONDS 和
+    ACCOUNT_DELAY_MAX_SECONDS 调整。
+    """
+    enabled = os.getenv("ACCOUNT_DELAY_ENABLED", "true").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return 0.0
+
+    try:
+        minimum = float(os.getenv("ACCOUNT_DELAY_MIN_SECONDS", "30"))
+        maximum = float(os.getenv("ACCOUNT_DELAY_MAX_SECONDS", "60"))
+        if not math.isfinite(minimum) or not math.isfinite(maximum):
+            raise ValueError("delay must be finite")
+        minimum = min(60.0, max(0.0, minimum))
+        maximum = min(60.0, max(0.0, maximum))
+    except (TypeError, ValueError):
+        minimum, maximum = 30.0, 60.0
+
+    if maximum < minimum:
+        minimum, maximum = maximum, minimum
+    return random.uniform(minimum, maximum)
+
+
 def cleanup_old_logs(log_dir: str, days: int = 30) -> int:
     """清理旧日志文件（保留最近N天）
 
@@ -126,8 +163,8 @@ def cleanup_old_logs(log_dir: str, days: int = 30) -> int:
         删除的日志文件数量
     """
     try:
-        from pathlib import Path
         import time
+        from pathlib import Path
 
         log_path = Path(log_dir)
         if not log_path.exists():
@@ -244,7 +281,7 @@ async def main():
     logger = setup_logging()
 
     # 检查依赖
-    check_dependencies()
+    await check_dependencies()
 
     # 验证环境变量
     if not validate_env_vars():
@@ -273,12 +310,14 @@ async def main():
 
     # 验证账号配置
     valid_accounts = []
+    invalid_accounts = []
     for i, account in enumerate(accounts):
         if validate_account(account, i):
             valid_accounts.append(account)
             auth_methods = ", ".join([auth.method for auth in account.auth_configs])
             logger.info(f"   ✅ {account.name} ({account.provider}) - 认证方式: {auth_methods}")
         else:
+            invalid_accounts.append(account)
             logger.warning(f"   ❌ {account.name} - 配置无效，跳过")
 
     if not valid_accounts:
@@ -307,7 +346,7 @@ async def main():
     total_count = 0
     notification_content = []
     current_balances = {}
-    need_notify = False
+    need_notify = bool(invalid_accounts)
 
     # 按平台分组统计
     platform_stats = {}
@@ -507,6 +546,15 @@ async def main():
                 'error': f"未知异常: {str(e)[:60]}",
                 'balance': None
             })
+        finally:
+            # 账号之间增加随机冷却，降低连续登录触发 WAF/频率限制的概率。
+            if i < len(valid_accounts) - 1:
+                delay = get_account_delay_seconds()
+                if delay > 0:
+                    logger.info(
+                        f"⏳ 账号间等待 {delay:.1f} 秒后继续下一个账号"
+                    )
+                    await asyncio.sleep(delay)
 
     # 检查余额变化
     current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
@@ -529,7 +577,7 @@ async def main():
         save_balance_hash(current_balance_hash)
 
     # 发送通知
-    if need_notify and platform_stats:
+    if need_notify and (platform_stats or invalid_accounts):
         # 构建融合后的通知内容
         notification_lines = []
 
@@ -539,12 +587,16 @@ async def main():
 
         # 统计结果
         total_success = sum(p['success'] for p in platform_stats.values())
-        total_failed = sum(p['failed'] for p in platform_stats.values())
+        runtime_failed = sum(p['failed'] for p in platform_stats.values())
+        config_failed = len(invalid_accounts)
+        total_failed = runtime_failed + config_failed
         total_accounts = total_success + total_failed
 
         notification_lines.append("📊 统计结果:")
         notification_lines.append(f"✓ 成功: {total_success} 个")
         notification_lines.append(f"✗ 失败: {total_failed} 个")
+        if config_failed:
+            notification_lines.append(f"⚠️ 配置无效、未执行: {config_failed} 个")
         notification_lines.append("")
 
         # 详细结果 - 按平台分组展示
@@ -591,6 +643,14 @@ async def main():
 
                 # 每个账号后添加空行分隔
                 notification_lines.append("")
+
+        if invalid_accounts:
+            notification_lines.append("⚠️ 配置无效账号（未执行）:")
+            for invalid_account in invalid_accounts:
+                notification_lines.append(
+                    f"   ❌ {invalid_account.name} ({invalid_account.provider})"
+                )
+            notification_lines.append("")
 
         # 移除最后一个多余的空行（因为后面紧跟着平台汇总）
         if notification_lines and notification_lines[-1] == "":
@@ -651,19 +711,31 @@ async def main():
 
     logger.info("\n" + "=" * 80)
     total_success_accounts = sum(p['success'] for p in platform_stats.values())
-    total_accounts = sum(p['success'] + p['failed'] for p in platform_stats.values())
+    total_runtime_failed = sum(p['failed'] for p in platform_stats.values())
+    total_failed_accounts = total_runtime_failed + len(invalid_accounts)
+    total_accounts = total_success_accounts + total_failed_accounts
     logger.info(f"✅ 程序执行完成 - 成功: {total_success_accounts}/{total_accounts} 个账号")
+    if invalid_accounts:
+        logger.info(f"⚠️ 配置无效、未执行: {len(invalid_accounts)} 个账号")
+    if total_failed_accounts:
+        logger.warning(f"⚠️ 失败账号总数: {total_failed_accounts}")
     logger.info("=" * 80)
 
     # 设置退出码
-    sys.exit(0 if total_success_accounts > 0 else 1)
+    fail_on_error = os.getenv("FAIL_ON_ANY_ACCOUNT_ERROR", "true").strip().lower()
+    if fail_on_error in {"0", "false", "no", "off"}:
+        sys.exit(0 if total_success_accounts > 0 else 1)
+    sys.exit(0 if total_accounts > 0 and total_failed_accounts == 0 else 1)
 
 
 def run_main():
     """运行主函数的包装函数"""
     logger = logging.getLogger(__name__)
     try:
-        asyncio.run(main())
+        result = asyncio.run(main())
+        # main() 的早期返回值也必须传递给 shell，不能静默变成成功。
+        if isinstance(result, int) and result != 0:
+            sys.exit(result)
     except KeyboardInterrupt:
         msg = "程序被用户中断"
         logger.warning(msg)

@@ -8,8 +8,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
-from utils.logger import setup_logger
+
 from utils.auth_method import AuthMethod
+from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -87,15 +88,36 @@ class AccountConfig:
             )
 
         # Email 认证
-        if "email" in data:
+        if "email" in data and data["email"] is not None:
             email_config = data["email"]
+            if not isinstance(email_config, dict):
+                logger.error(
+                    f"❌ Account {index + 1} ({name}): email 配置必须是对象"
+                )
+                email_config = {}
             auth_configs.append(
                 AuthConfig(
                     method=AuthMethod.EMAIL,
                     username=email_config.get("username") or email_config.get("email"),
                     password=email_config.get("password"),
+                    # Email 账号也允许显式指定站内用户 ID。
+                    # 当站点不把用户信息写入 localStorage 时，不能依赖账号名猜测 ID。
+                    api_user=email_config.get("api_user") or data.get("api_user"),
                 )
             )
+
+        # 主分支不实现 OAuth 认证。显式提示旧配置中的字段，避免只看到
+        # “No authentication method configured” 而无法定位配置版本不匹配。
+        if not auth_configs:
+            unsupported_fields = [
+                key for key in ("github", "linuxdo", "linux.do", "oauth")
+                if data.get(key)
+            ]
+            if unsupported_fields:
+                logger.error(
+                    f"❌ Account {index + 1} ({name}): 当前分支不支持认证字段 "
+                    f"{', '.join(unsupported_fields)}，仅支持 cookies/email"
+                )
 
         return cls(name=name, provider=provider, auth_configs=auth_configs)
 
@@ -148,6 +170,7 @@ class AppConfig:
                         login_url=config["login_url"],
                         checkin_url=config["checkin_url"],
                         user_info_url=config["user_info_url"],
+                        api_user_key=config.get("api_user_key", "New-Api-User"),
                     )
             except Exception as e:
                 logger.warning(f"⚠️ Failed to load custom providers: {e}")
@@ -296,7 +319,7 @@ def validate_password_strength(
 
     # 检查重复字符（如 "111111", "aaaaaa"）
     if len(set(password)) <= 2 and len(password) >= 6:
-        return False, f"密码过于简单（重复字符过多，存在安全风险）"
+        return False, "密码过于简单（重复字符过多，存在安全风险）"
 
     # 检查连续字符（如 "123456", "abcdef"）
     consecutive_patterns = [
@@ -307,7 +330,7 @@ def validate_password_strength(
     ]
     for pattern in consecutive_patterns:
         if password.lower() in pattern and len(password) >= 5:
-            return False, f"密码过于简单（包含连续字符序列，存在安全风险）"
+            return False, "密码过于简单（包含连续字符序列，存在安全风险）"
 
     return True, None
 
@@ -441,7 +464,8 @@ def validate_account(account: AccountConfig, index: int) -> bool:
             # api_user 现在是可选的，可以从认证后的用户信息API自动获取
             if not auth.api_user:
                 logger.info(
-                    f"ℹ️  Account {index + 1} ({account.name}): api_user 未配置，将从认证后自动获取"
+                    f"ℹ️  Account {index + 1} ({account.name}): api_user 未配置，"
+                    "仅在用户信息 API 能直接识别会话时继续，不会使用账号名冒充"
                 )
 
         elif auth.method == AuthMethod.EMAIL:

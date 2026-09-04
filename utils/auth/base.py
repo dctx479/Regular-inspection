@@ -2,29 +2,32 @@
 认证器基类 - 提供所有认证方式的通用功能
 """
 
-import os
 import asyncio
+import json
+import os
 import random
-from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, Tuple
-from playwright.async_api import Page, BrowserContext
 import re
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Optional, Tuple
 
-from utils.config import AuthConfig, ProviderConfig
-from utils.logger import setup_logger
-from utils.sanitizer import sanitize_exception
+from playwright.async_api import BrowserContext, Page
+
 from utils.ci_config import CIConfig
+from utils.config import AuthConfig, ProviderConfig
 from utils.constants import (
     DEFAULT_USER_AGENT,
     KEY_COOKIE_NAMES,
     TimeoutConfig,
 )
 from utils.human_behavior import (
+    simulate_click_with_behavior,
     simulate_human_behavior,
     simulate_page_interaction,
     simulate_typing,
-    simulate_click_with_behavior,
 )
+from utils.logger import setup_logger
+from utils.retry import retry_on_status
+from utils.sanitizer import sanitize_exception
 
 # 模块级logger
 logger = setup_logger(__name__)
@@ -161,7 +164,7 @@ class Authenticator(ABC):
         try:
             # 检查是否跳过Cloudflare验证
             if os.getenv("SKIP_CLOUDFLARE_CHECK", "false").lower() == "true":
-                logger.info(f"ℹ️ 已配置跳过Cloudflare验证检查")
+                logger.info("ℹ️ 已配置跳过Cloudflare验证检查")
                 return True
 
             for retry in range(max_retries):
@@ -177,7 +180,7 @@ class Authenticator(ABC):
                     # 重试策略1: 刷新页面
                     if retry == 1:
                         try:
-                            logger.info(f"🔄 策略1: 刷新页面")
+                            logger.info("🔄 策略1: 刷新页面")
                             await page.reload(
                                 wait_until="domcontentloaded", timeout=30000
                             )
@@ -188,7 +191,7 @@ class Authenticator(ABC):
                     # 重试策略2: 重新访问登录页
                     elif retry == 2:
                         try:
-                            logger.info(f"🔄 策略2: 重新访问登录页")
+                            logger.info("🔄 策略2: 重新访问登录页")
                             await page.goto(
                                 self.provider_config.get_login_url(),
                                 wait_until="domcontentloaded",
@@ -205,7 +208,7 @@ class Authenticator(ABC):
                 # CI 环境下，在开始等待前添加行为模拟
                 if self.enable_behavior_simulation and retry == 0:
                     try:
-                        logger.info(f"🤖 CI 环境：开始模拟人类行为以提高验证通过率...")
+                        logger.info("🤖 CI 环境：开始模拟人类行为以提高验证通过率...")
                         await simulate_page_interaction(page, logger)
                     except Exception as sim_error:
                         logger.debug(f"⚠️ 行为模拟异常（非致命）: {sim_error}")
@@ -267,7 +270,7 @@ class Authenticator(ABC):
                             )
                             verification_passed = True
                             break
-                    except:
+                    except Exception:
                         pass
 
                     # 更短的等待时间
@@ -308,17 +311,18 @@ class Authenticator(ABC):
     ) -> bool:
         """等待会话cookies出现"""
         try:
-            logger.info(f"⏳ 等待会话cookies设置...")
+            logger.info("⏳ 等待会话cookies设置...")
             start_time = asyncio.get_event_loop().time()
 
             while asyncio.get_event_loop().time() - start_time < max_wait_seconds:
                 cookies = await context.cookies()
                 cookies_dict = {cookie["name"]: cookie["value"] for cookie in cookies}
 
-                # 检查是否有会话相关的cookies
-                found_session = any(name in cookies_dict for name in KEY_COOKIE_NAMES)
+                # 只把真正的认证 cookie 视为会话建立。
+                # WAF cookie 或 csrf_token 存在时不能说明登录成功。
+                found_session = self._has_authenticated_cookie(cookies_dict)
                 if found_session:
-                    logger.info(f"✅ 检测到会话cookies")
+                    logger.info("✅ 检测到会话cookies")
                     return True
 
                 await asyncio.sleep(0.5)  # 每500ms检查一次
@@ -330,6 +334,208 @@ class Authenticator(ABC):
             logger.warning(f"⚠️ 等待会话cookies异常: {e}")
             return False
 
+    @staticmethod
+    def _has_authenticated_cookie(cookies: Dict[str, str]) -> bool:
+        """判断 cookie 集合中是否包含认证会话 cookie。
+
+        不能仅通过 cookie 数量或 WAF cookie 判断登录状态。不同 Provider
+        的会话 cookie 名称可能不同，因此保留常见名称并排除 csrf/WAF cookie。
+        """
+        if not cookies:
+            return False
+
+        session_names = {
+            "session",
+            "sessionid",
+            "connect.sid",
+            "jsessionid",
+            "phpsessid",
+            "token",
+            "auth",
+            "jwt",
+        }
+        waf_names = {"acw_tc", "cdn_sec_tc", "acw_sc__v2", "__cf_bm", "cf_clearance"}
+
+        return any(
+            str(name).lower() in session_names
+            and str(name).lower() not in waf_names
+            for name in cookies
+        )
+
+    def _get_api_user_header_name(self) -> str:
+        """获取 Provider 配置的 API User 请求头名称。"""
+        return self.provider_config.api_user_key or "New-Api-User"
+
+    @staticmethod
+    def _infer_api_user(account_name: str) -> Optional[str]:
+        """仅从无歧义的数字后缀推断 API User。
+
+        账号显示名不是站内用户 ID。为兼容类似 ``linuxdo_84404`` 的旧配置，
+        只接受名称末尾独立的 5 位以上数字；诸如 ``user2021``、``zj`` 等
+        名称不会被误当成用户 ID。
+        """
+        match = re.search(r"(?:^|[_-])(\d{5,})$", str(account_name or "").strip())
+        return match.group(1) if match else None
+
+    async def _fetch_user_info_in_browser(
+        self,
+        page: Page,
+        api_user: Optional[str] = None,
+        retry_statuses: Optional[Tuple[int, ...]] = None,
+    ) -> Dict[str, Any]:
+        """在当前浏览器上下文中查询用户信息。
+
+        使用浏览器 fetch 可以携带同一上下文中的 session/WAF cookie，避免
+        认证成功后再用独立 HTTP 客户端触发额外的 WAF 拦截。
+        """
+        headers = {
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if api_user:
+            headers[self._get_api_user_header_name()] = str(api_user)
+
+        async def fetch_once() -> Dict[str, Any]:
+            try:
+                result = await page.evaluate(
+                    """
+                    async ({url, headers}) => {
+                        try {
+                            const response = await fetch(url, {
+                                method: 'GET',
+                                headers,
+                                credentials: 'include'
+                            });
+
+                            const contentType = response.headers.get('content-type') || '';
+                            let data;
+                            if (contentType.toLowerCase().includes('application/json')) {
+                                try {
+                                    data = await response.json();
+                                } catch (parseError) {
+                                    data = await response.text();
+                                }
+                            } else {
+                                data = await response.text();
+                            }
+
+                            return {
+                                status: response.status,
+                                ok: response.ok,
+                                contentType,
+                                retryAfter: response.headers.get('retry-after'),
+                                data
+                            };
+                        } catch (error) {
+                            return {
+                                status: 0,
+                                ok: false,
+                                error: error.message
+                            };
+                        }
+                    }
+                    """,
+                    {"url": self.provider_config.get_user_info_url(), "headers": headers},
+                )
+                if isinstance(result, dict):
+                    return result
+                return {"status": 0, "ok": False, "error": "Invalid browser response"}
+            except Exception as e:
+                return {"status": 0, "ok": False, "error": sanitize_exception(e)}
+
+        return await retry_on_status(
+            fetch_once,
+            logger=logger,
+            operation_name=f"[{self.account_name}] 用户信息 API",
+            retry_statuses=retry_statuses,
+        )
+
+    async def _validate_authenticated_session(
+        self,
+        page: Page,
+        context: BrowserContext,
+        api_user: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """验证当前上下文是否真的已认证。
+
+        页面能打开、URL 不含 login、或存在某个 UI 元素都不能作为认证凭据。
+        只有用户信息 API 返回成功并包含用户数据时才返回 success=True。
+        """
+        try:
+            cookies = await context.cookies()
+            cookies_dict = {cookie["name"]: cookie["value"] for cookie in cookies}
+            has_session = self._has_authenticated_cookie(cookies_dict)
+            # 没有任何会话迹象时，403 更可能是登录未建立，而不是临时 IP
+            # 限制；避免对明显失败的登录无意义地等待多轮。
+            retry_statuses = (403, 429) if has_session else ()
+            result = await self._fetch_user_info_in_browser(
+                page, api_user, retry_statuses=retry_statuses
+            )
+
+            status = result.get("status")
+            data = result.get("data")
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    data = None
+
+            if (
+                status == 200
+                and isinstance(data, dict)
+                and data.get("success")
+                and isinstance(data.get("data"), dict)
+            ):
+                user_data = data["data"]
+                user_id = (
+                    user_data.get("id")
+                    or user_data.get("user_id")
+                    or user_data.get("userId")
+                    or api_user
+                )
+                username = (
+                    user_data.get("username")
+                    or user_data.get("name")
+                    or user_data.get("email")
+                )
+
+                # 如果响应只有用户名而没有用户 ID，至少要确认存在真实
+                # 会话 cookie，避免把公开接口的访客数据当成已登录。
+                if user_id or (username and self._has_authenticated_cookie(cookies_dict)):
+                    return {
+                        "success": True,
+                        "user_id": str(user_id) if user_id else None,
+                        "username": username,
+                        "cookies": cookies_dict,
+                        "status": status,
+                    }
+
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+            if message:
+                message = sanitize_exception(str(message))[:160]
+
+            if status:
+                error = f"用户信息 API 返回 HTTP {status}"
+                if message:
+                    error += f": {message}"
+            else:
+                error = result.get("error") or "用户信息 API 请求失败"
+
+            return {
+                "success": False,
+                "status": status,
+                "error": error,
+                "cookies": cookies_dict,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "status": 0,
+                "error": f"认证会话验证异常: {sanitize_exception(e)}",
+            }
+
     async def _extract_user_info(
         self, page: Page, cookies: Dict[str, str]
     ) -> Tuple[Optional[str], Optional[str]]:
@@ -338,8 +544,10 @@ class Authenticator(ABC):
             import httpx
 
             headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
+            if self.auth_config.api_user:
+                headers[self._get_api_user_header_name()] = str(self.auth_config.api_user)
             async with httpx.AsyncClient(
-                cookies=cookies, timeout=10.0, verify=True
+                cookies=cookies, timeout=10.0, verify=True, trust_env=False
             ) as client:
                 response = await client.get(
                     self.provider_config.get_user_info_url(), headers=headers
@@ -402,10 +610,10 @@ class Authenticator(ABC):
                     if user_id and user_id.isdigit():
                         logger.info(f"✅ 从页面元素提取到用户ID: {user_id}")
                         return user_id, None
-            except:
+            except Exception:
                 pass
 
-            logger.warning(f"⚠️ 无法从页面提取用户信息")
+            logger.warning("⚠️ 无法从页面提取用户信息")
         except Exception as e:
             logger.warning(f"⚠️ 从页面提取用户信息异常: {e}")
 
@@ -416,7 +624,7 @@ class Authenticator(ABC):
     ) -> Tuple[Optional[str], Optional[str]]:
         """从localStorage提取用户标识"""
         try:
-            logger.info(f"🔍 尝试从localStorage提取用户信息")
+            logger.info("🔍 尝试从localStorage提取用户信息")
 
             # 等待5秒，确保localStorage已更新
             await page.wait_for_timeout(TimeoutConfig.MEDIUM_WAIT)
@@ -437,9 +645,9 @@ class Authenticator(ABC):
                     logger.info(f"✅ 从localStorage提取到用户ID: {user_id}")
                     return str(user_id), username
                 else:
-                    logger.warning(f"⚠️ localStorage中未找到用户ID")
+                    logger.warning("⚠️ localStorage中未找到用户ID")
             else:
-                logger.warning(f"⚠️ localStorage中未找到用户数据")
+                logger.warning("⚠️ localStorage中未找到用户数据")
         except Exception as e:
             logger.warning(f"⚠️ 从localStorage提取用户信息异常: {e}")
 
@@ -528,17 +736,37 @@ class Authenticator(ABC):
     async def _init_page_and_check_cloudflare(self, page: Page) -> bool:
         """初始化页面并检查Cloudflare"""
         try:
-            await page.goto(
-                self.provider_config.get_login_url(),
-                wait_until="domcontentloaded",
-                timeout=TimeoutConfig.PAGE_LOAD,
+            async def goto_once() -> Dict[str, Any]:
+                response = await page.goto(
+                    self.provider_config.get_login_url(),
+                    wait_until="domcontentloaded",
+                    timeout=TimeoutConfig.PAGE_LOAD,
+                )
+                status = getattr(response, "status", 200) if response is not None else 200
+                if not isinstance(status, int):
+                    status = 200
+                return {"status": status, "ok": 200 <= status < 400}
+
+            navigation_result = await retry_on_status(
+                goto_once,
+                logger=logger,
+                operation_name=f"[{self.account_name}] 登录页",
+                retry_statuses=(403, 429, 500, 502, 503, 504),
             )
+            if not navigation_result.get("ok") and navigation_result.get("status") in (
+                403,
+                429,
+            ):
+                logger.warning(
+                    f"⚠️ [{self.account_name}] 登录页持续返回 HTTP "
+                    f"{navigation_result.get('status')}"
+                )
             await page.wait_for_timeout(TimeoutConfig.SHORT_WAIT_3)
 
             # CI 环境下，页面加载后添加行为模拟
             if self.enable_behavior_simulation:
                 try:
-                    logger.info(f"🤖 CI 环境：页面加载后模拟人类浏览行为...")
+                    logger.info("🤖 CI 环境：页面加载后模拟人类浏览行为...")
                     await simulate_human_behavior(page, logger)
                 except Exception as sim_error:
                     logger.debug(f"⚠️ 页面加载后行为模拟异常（非致命）: {sim_error}")
@@ -555,7 +783,7 @@ class Authenticator(ABC):
             )
 
             if is_cloudflare:
-                logger.info(f"🛡️ 检测到Cloudflare验证页面，等待通过...")
+                logger.info("🛡️ 检测到Cloudflare验证页面，等待通过...")
                 return await self._wait_for_cloudflare_challenge(page)
             return True
         except Exception as e:
@@ -575,7 +803,7 @@ class Authenticator(ABC):
             for name in found_key_cookies:
                 logger.info(f"   ✅ 找到关键cookie: {name}")
         else:
-            logger.warning(f"   ⚠️ 未找到标准认证cookie")
+            logger.warning("   ⚠️ 未找到标准认证cookie")
             for i, cookie in enumerate(final_cookies[:5]):
                 cookie_domain = cookie.get("domain", "N/A")
                 logger.info(f"      {cookie['name']}: *** (domain: {cookie_domain})")
@@ -675,7 +903,7 @@ class Authenticator(ABC):
             # CI 环境下模拟行为
             if self.enable_behavior_simulation:
                 try:
-                    logger.info(f"🤖 CI 环境：访问页面后模拟人类行为...")
+                    logger.info("🤖 CI 环境：访问页面后模拟人类行为...")
                     await simulate_human_behavior(page, logger)
                 except Exception as sim_error:
                     logger.debug(f"⚠️ 页面访问后行为模拟异常（非致命）: {sim_error}")

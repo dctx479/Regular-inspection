@@ -137,7 +137,8 @@ Cookie 过期? → 自动重新认证
        "provider": "anyrouter",
        "email": {
          "username": "your@email.com",
-         "password": "yourpassword"
+         "password": "yourpassword",
+         "api_user": "12345"
        }
      },
      {
@@ -381,8 +382,15 @@ PROVIDERS='{
 | `AGENTROUTER_ACCOUNTS` | AgentRouter 账号配置（JSON数组） | 否* |
 | `ACCOUNTS` | 统一账号配置（支持多 Provider）| 否* |
 | `PROVIDERS` | 自定义 Provider 配置 | 否 |
-| `CI_DISABLED_AUTH_METHODS` | CI 环境禁用的认证方式（逗号分隔，如 `github,linux.do`） | 否 |
+| `CI_DISABLED_AUTH_METHODS` | CI 环境禁用的认证方式（测试分支适用，逗号分隔） | 否 |
 | `SESSION_CACHE_KEY` | 会话缓存加密密钥（建议设置） | 否 |
+| `ACCOUNT_DELAY_ENABLED` | 是否启用账号间随机冷却（默认 `true`） | 否 |
+| `ACCOUNT_DELAY_MIN_SECONDS` | 账号间最短等待秒数（默认 `30`） | 否 |
+| `ACCOUNT_DELAY_MAX_SECONDS` | 账号间最长等待秒数（默认 `60`） | 否 |
+| `STATUS_RETRY_COUNT` | 临时 403/429/5xx 的重试次数（默认 `2`） | 否 |
+| `STATUS_RETRY_BASE_SECONDS` | 状态码重试基础等待秒数（默认 `20`） | 否 |
+| `STATUS_RETRY_MAX_SECONDS` | 单次状态码重试最大等待秒数（上限 `60`） | 否 |
+| `FAIL_ON_ANY_ACCOUNT_ERROR` | 任一账号失败时返回非零退出码（默认 `true`） | 否 |
 | **代理配置（可选）** | | |
 | `USE_PROXY` | 全局启用代理（设置为 `true` 启用） | 否 |
 | `PROXY_SUBSCRIPTION_URL` | 订阅代理链接（支持 Clash/V2Ray/SIP002 格式） | 否 |
@@ -606,6 +614,8 @@ Regular-inspection/
 4. **通知未收到** - 检查配置，默认仅失败、首次运行或余额变化时通知
 5. **Actions 未执行** - 启用工作流，注意延迟正常
 6. **CI 环境 OAuth 认证失败** - 建议配置 `CI_DISABLED_AUTH_METHODS=github,linux.do` 或改用 Cookies 认证
+
+> 遇到临时 HTTP 403/429/5xx 时，脚本会使用指数退避和随机抖动重试；账号之间默认等待 30–60 秒。可通过 `ACCOUNT_DELAY_*` 和 `STATUS_RETRY_*` 环境变量调整。
 
 > 💡 **提示：** "签到成功" 表示账号登录有效，已完成保活操作！
 

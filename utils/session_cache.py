@@ -2,13 +2,15 @@
 会话缓存模块 - 保存和恢复认证会话（支持加密）
 """
 
+import base64
 import json
 import os
-import base64
-from pathlib import Path
-from typing import Dict, Optional, List, Any
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from cryptography.fernet import Fernet, InvalidToken
+
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -66,7 +68,7 @@ class SessionCache:
                 self.cipher = None
         else:
             logger.warning(
-                "⚠️ SESSION_CACHE_KEY 未设置，会话数据将使用Base64编码（建议设置环境变量启用加密）"
+                "⚠️ SESSION_CACHE_KEY 未设置，会话数据将使用Base64编码（不加密，建议设置环境变量）"
             )
             logger.info("💡 提示：运行以下命令生成 Fernet 密钥：")
             logger.info(
@@ -209,9 +211,11 @@ class SessionCache:
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(cache_data, f, indent=2, ensure_ascii=False)
 
-            encryption_method = "Fernet AES-128" if self.cipher else "Base64"
+            encryption_method = (
+                "Fernet AES-128" if self.cipher else "Base64（不加密）"
+            )
             logger.info(
-                f"✅ 会话缓存已保存（{encryption_method} 加密）: {account_name} ({provider})"
+                f"✅ 会话缓存已保存（{encryption_method}）: {account_name} ({provider})"
             )
             return True
 
@@ -256,15 +260,16 @@ class SessionCache:
                 # 合并解密的数据
                 cache_data["cookies"] = sensitive_data.get("cookies", [])
                 cache_data["user_id"] = sensitive_data.get("user_id")
+                decode_method = "已解密" if self.cipher else "已Base64解码（不加密）"
                 logger.info(
-                    f"✅ 会话缓存加载成功（已解密）: {account_name} ({provider})"
+                    f"✅ 会话缓存加载成功（{decode_method}）: {account_name} ({provider})"
                 )
             else:
                 # 旧格式：明文存储（向后兼容）
                 logger.warning(
                     f"⚠️ 加载旧格式会话缓存（明文）: {account_name} ({provider})"
                 )
-                logger.info(f"💡 建议重新登录以使用加密缓存")
+                logger.info("💡 建议重新登录以使用加密缓存")
 
             return cache_data
 

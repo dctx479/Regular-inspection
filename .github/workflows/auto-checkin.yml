@@ -22,10 +22,10 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 设置 Python 环境
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -34,6 +34,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: 运行测试
+        run: python -m pytest -q
 
       - name: 获取 Playwright 版本
         id: playwright-version
@@ -44,7 +47,7 @@ jobs:
 
       - name: 缓存 Playwright 浏览器
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}
@@ -157,6 +160,13 @@ jobs:
           # CI 环境优化
           CI_DISABLED_AUTH_METHODS: ${{ secrets.CI_DISABLED_AUTH_METHODS }}
           SESSION_CACHE_KEY: ${{ secrets.SESSION_CACHE_KEY }}
+          ACCOUNT_DELAY_ENABLED: ${{ vars.ACCOUNT_DELAY_ENABLED || 'true' }}
+          ACCOUNT_DELAY_MIN_SECONDS: ${{ vars.ACCOUNT_DELAY_MIN_SECONDS || '30' }}
+          ACCOUNT_DELAY_MAX_SECONDS: ${{ vars.ACCOUNT_DELAY_MAX_SECONDS || '60' }}
+          STATUS_RETRY_COUNT: ${{ vars.STATUS_RETRY_COUNT || '2' }}
+          STATUS_RETRY_BASE_SECONDS: ${{ vars.STATUS_RETRY_BASE_SECONDS || '20' }}
+          STATUS_RETRY_MAX_SECONDS: ${{ vars.STATUS_RETRY_MAX_SECONDS || '60' }}
+          FAIL_ON_ANY_ACCOUNT_ERROR: ${{ vars.FAIL_ON_ANY_ACCOUNT_ERROR || 'true' }}
         run: |
           python main.py
 
@@ -190,7 +200,7 @@ jobs:
           fi
 
       - name: 上传余额记录（备份）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: balance-data-${{ github.run_number }}

@@ -5,42 +5,40 @@
 """
 
 import asyncio
-import hashlib
 import json
 import os
+import re
 import tempfile
 import time
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, List, Tuple, Optional, Any
+from decimal import ROUND_HALF_UP, Decimal
 from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import BrowserContext, Page, async_playwright
 
-from utils.config import AccountConfig, ProviderConfig, AuthConfig
 from utils.auth import get_authenticator
-from utils.auth_method import AuthMethod
-from utils.logger import setup_logger
-from utils.session_cache import SessionCache
 from utils.ci_config import CIConfig
+from utils.config import AccountConfig, AuthConfig, ProviderConfig
 from utils.constants import (
-    DEFAULT_USER_AGENT,
-    BROWSER_USER_AGENT,
-    KEY_COOKIE_NAMES,
-    BROWSER_LAUNCH_ARGS,
-    BROWSER_VIEWPORT,
-    HTTP_TIMEOUT,
     BROWSER_PAGE_LOAD_TIMEOUT,
+    BROWSER_USER_AGENT,
+    BROWSER_VIEWPORT,
     DEFAULT_MAX_RETRIES,
-    DEFAULT_RETRY_DELAY,
     DEFAULT_RETRY_BACKOFF,
+    DEFAULT_RETRY_DELAY,
+    DEFAULT_USER_AGENT,
+    HTTP_TIMEOUT,
+    KEY_COOKIE_NAMES,
     QUOTA_TO_DOLLAR_RATE,
-    WAF_COOKIE_NAMES,
-    RATE_LIMIT_DELAY_MIN,
     RATE_LIMIT_DELAY_MAX,
+    RATE_LIMIT_DELAY_MIN,
+    WAF_COOKIE_NAMES,
 )
 from utils.enhanced_stealth import EnhancedStealth, ProxyManager, StealthConfig
-from utils.rate_limiter import global_rate_limiter, adaptive_delay
+from utils.logger import setup_logger
+from utils.rate_limiter import global_rate_limiter
+from utils.retry import retry_on_status
 
 
 def performance_monitor(func):
@@ -104,7 +102,6 @@ class CheckIn:
         self.balance_data_file = "balance_data.json"
         self.logger = setup_logger(__name__)
         self._playwright = None
-        self.session_cache = SessionCache()  # 添加会话缓存实例
 
     async def __aenter__(self):
         """进入上下文时初始化浏览器"""
@@ -137,7 +134,7 @@ class CheckIn:
             "Pragma": "no-cache",
         }
         if api_user:
-            headers["New-Api-User"] = str(api_user)
+            headers[self.provider.api_user_key or "New-Api-User"] = str(api_user)
         return headers
 
     async def execute(self) -> List[Tuple[str, bool, Optional[Dict[str, Any]]]]:
@@ -158,7 +155,7 @@ class CheckIn:
             self.logger.info(f"{'='*60}")
 
             try:
-                success, user_info = await self._checkin_with_auth(auth_config)
+                success, user_info = await self._checkin_with_auth_with_retry(auth_config)
                 results.append((auth_config.method.value, success, user_info))
 
                 if success:
@@ -182,6 +179,55 @@ class CheckIn:
                 results.append((auth_config.method.value, False, {"error": str(e)}))
 
         return results
+
+    @staticmethod
+    def _extract_status_code(info: Optional[Dict[str, Any]]) -> Optional[int]:
+        """从认证结果中提取 HTTP 状态码。"""
+        if not isinstance(info, dict):
+            return None
+        status = info.get("status")
+        if isinstance(status, int):
+            return status
+        message = str(info.get("error") or info.get("message") or "")
+        match = re.search(r"HTTP\s+(\d{3})", message, flags=re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    async def _checkin_with_auth_with_retry(
+        self, auth_config: AuthConfig
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """对认证阶段的临时 403/429/5xx 做有限次数退避重试。
+
+        签到 POST 本身在 ``_do_checkin_in_browser`` 中单独重试；这里主要
+        覆盖登录页/WAF/API 预检阶段的临时限制。
+        """
+
+        async def operation() -> Dict[str, Any]:
+            success, info = await self._checkin_with_auth(auth_config)
+            if success:
+                return {
+                    "status": 200,
+                    "ok": True,
+                    "payload": (success, info),
+                }
+
+            status = self._extract_status_code(info)
+            retry_auth = bool(info.get("retry_auth")) if isinstance(info, dict) else False
+            # 只有认证/WAF 阶段明确标记为可重试时才再次启动浏览器。
+            if not retry_auth:
+                status = 0
+            return {
+                "status": status or 0,
+                "ok": False,
+                "payload": (success, info),
+            }
+
+        result = await retry_on_status(
+            operation,
+            logger=self.logger,
+            operation_name=f"[{self.account.name}] {auth_config.method.value} 认证",
+            retry_statuses=(403, 429, 500, 502, 503, 504),
+        )
+        return result.get("payload", (False, {"error": "Authentication failed"}))
 
     async def _checkin_with_auth(
         self, auth_config: AuthConfig
@@ -324,9 +370,16 @@ class CheckIn:
                 auth_result = await authenticator.authenticate(page, context)
 
                 if not auth_result["success"]:
-                    return False, {
-                        "error": auth_result.get("error", "Authentication failed")
+                    error_info = {
+                        "error": auth_result.get("error", "Authentication failed"),
+                        "status": auth_result.get("status"),
                     }
+                    status = self._extract_status_code(error_info)
+                    if status is not None:
+                        error_info["status"] = status
+                    if status in (403, 429, 500, 502, 503, 504):
+                        error_info["retry_auth"] = True
+                    return False, error_info
 
                 # 获取认证后的 cookies 和用户信息
                 auth_cookies = auth_result.get("cookies", {})
@@ -340,7 +393,7 @@ class CheckIn:
                         f"✅ [{self.account.name}] 认证成功，用户ID: {auth_user_id}"
                     )
                 elif auth_username:
-                    auth_config.api_user = auth_username
+                    # 用户名只用于展示，不能作为 New-Api-User 请求头。
                     self.logger.info(
                         f"✅ [{self.account.name}] 认证成功，用户名: {auth_username}"
                     )
@@ -382,7 +435,8 @@ class CheckIn:
                     )
                     if not checkin_result["success"]:
                         return False, {
-                            "error": checkin_result.get("message", "Check-in failed")
+                            "error": checkin_result.get("message", "Check-in failed"),
+                            "status": checkin_result.get("status"),
                         }
 
                     self.logger.info(
@@ -453,10 +507,12 @@ class CheckIn:
 
                 # 清理临时目录
                 try:
-                    if temp_dir and os.path.exists(temp_dir):
+                    if temp_dir and await asyncio.to_thread(os.path.exists, temp_dir):
                         import shutil
 
-                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        await asyncio.to_thread(
+                            shutil.rmtree, temp_dir, ignore_errors=True
+                        )
                         self.logger.debug(
                             f"🗑️ [{self.account.name}] 临时目录已清理: {temp_dir}"
                         )
@@ -471,10 +527,22 @@ class CheckIn:
             self.logger.info(f"ℹ️ [{self.account.name}] 正在获取 WAF cookies...")
 
             # 访问登录页面以触发 WAF
-            await page.goto(
-                self.provider.get_login_url(),
-                wait_until="domcontentloaded",
-                timeout=BROWSER_PAGE_LOAD_TIMEOUT,
+            async def navigate_once() -> Dict[str, Any]:
+                response = await page.goto(
+                    self.provider.get_login_url(),
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_PAGE_LOAD_TIMEOUT,
+                )
+                status = getattr(response, "status", 200) if response is not None else 200
+                if not isinstance(status, int):
+                    status = 200
+                return {"status": status, "ok": 200 <= status < 400}
+
+            await retry_on_status(
+                navigate_once,
+                logger=self.logger,
+                operation_name=f"[{self.account.name}] WAF 登录页",
+                retry_statuses=(403, 429, 500, 502, 503, 504),
             )
 
             # 等待页面加载
@@ -482,7 +550,7 @@ class CheckIn:
                 await page.wait_for_function(
                     'document.readyState === "complete"', timeout=5000
                 )
-            except:
+            except Exception:
                 await page.wait_for_timeout(3000)
 
             # 提取 WAF cookies
@@ -518,18 +586,34 @@ class CheckIn:
                 self.logger.info(f"   ✅ 找到关键cookie: {cookie_name}")
 
         if not found_key_cookies:
-            self.logger.warning(f"   ⚠️ 未找到标准认证cookie，尝试所有可用cookies")
+            self.logger.warning("   ⚠️ 未找到标准认证cookie，尝试所有可用cookies")
             for cookie_name in list(cookies.keys())[:5]:
                 self.logger.info(f"   📄 可用cookie: {cookie_name}")
+
+    @staticmethod
+    def _response_detail(data: Any) -> str:
+        """提取安全、简短的 API 错误说明，不记录整段 HTML。"""
+        if not isinstance(data, dict):
+            return ""
+        detail = data.get("message") or data.get("error") or data.get("msg")
+        if detail is None:
+            return ""
+        return " ".join(str(detail).split())[:160]
 
     def _prepare_checkin_headers(self, auth_config: AuthConfig) -> Dict[str, str]:
         """准备签到请求头"""
         api_user = auth_config.api_user
         if not api_user:
             api_user = self._infer_api_user(self.account.name)
-            self.logger.info(
-                f"🔍 [{self.account.name}] 从账号名称推断API User: {api_user}"
-            )
+            if api_user:
+                self.logger.info(
+                    f"🔍 [{self.account.name}] 从账号名称推断 API User: {api_user}"
+                )
+            else:
+                self.logger.warning(
+                    f"⚠️ [{self.account.name}] 未配置可靠的 API User，"
+                    "不会使用账号名伪造请求头"
+                )
 
         headers = self._build_request_headers(api_user)
         headers.update(
@@ -562,7 +646,7 @@ class CheckIn:
         response_headers = dict(response.headers)
         if "set-cookie" in response_headers:
             self.logger.info(
-                f"🍪 [{self.account.name}] 响应包含新cookies: {response_headers['set-cookie'][:100]}..."
+                f"🍪 [{self.account.name}] 响应包含新 cookies（内容已隐藏）"
             )
 
         # 使用策略模式处理不同状态码
@@ -588,11 +672,19 @@ class CheckIn:
             )
 
             if data.get("success"):
-                return {"success": True, "message": data.get("message", "签到成功")}
+                return {
+                    "success": True,
+                    "status": response.status_code,
+                    "message": data.get("message", "签到成功"),
+                }
             else:
                 error_msg = data.get("message", "签到失败")
                 self.logger.error(f"❌ [{self.account.name}] 签到失败: {error_msg}")
-                return {"success": False, "message": error_msg}
+                return {
+                    "success": False,
+                    "status": response.status_code,
+                    "message": error_msg,
+                }
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             self.logger.error(f"❌ [{self.account.name}] 解析签到响应失败: {e}")
             self.logger.info(
@@ -602,7 +694,11 @@ class CheckIn:
                 self.logger.info(
                     f"🔄 [{self.account.name}] 检测到HTML响应，可能需要重新登录"
                 )
-            return {"success": False, "message": "响应解析失败"}
+            return {
+                "success": False,
+                "status": response.status_code,
+                "message": "响应解析失败",
+            }
 
     async def _handle_401_response(self, client: httpx.AsyncClient) -> Dict[str, Any]:
         """处理401认证失败响应"""
@@ -613,14 +709,22 @@ class CheckIn:
             page_response = await client.get(self.provider.base_url)
             if "login" in page_response.text.lower():
                 self.logger.info(f"🔄 [{self.account.name}] 检测到需要重新登录")
-            return {"success": False, "message": "认证已过期，需要重新登录"}
-        except:
-            return {"success": False, "message": "认证已过期，需要重新登录"}
+            return {
+                "success": False,
+                "status": 401,
+                "message": "认证已过期，需要重新登录",
+            }
+        except Exception:
+            return {
+                "success": False,
+                "status": 401,
+                "message": "认证已过期，需要重新登录",
+            }
 
     def _handle_403_response(self) -> Dict[str, Any]:
         """处理403禁止访问响应"""
         self.logger.error(f"❌ [{self.account.name}] 访问被禁止 (403) - 权限不足")
-        return {"success": False, "message": "访问被禁止"}
+        return {"success": False, "status": 403, "message": "访问被禁止"}
 
     async def _handle_404_response(
         self, client: httpx.AsyncClient, headers: Dict[str, str]
@@ -645,6 +749,7 @@ class CheckIn:
                     )
                     return {
                         "success": True,
+                        "status": 404,
                         "message": "签到接口不存在，但账号状态正常",
                     }
                 else:
@@ -659,7 +764,11 @@ class CheckIn:
             self.logger.warning(f"⚠️ [{self.account.name}] 用户信息查询异常: {e}")
 
         self.logger.error(f"❌ [{self.account.name}] 签到接口和用户信息查询都失败")
-        return {"success": False, "message": "签到接口404，用户信息查询也失败"}
+        return {
+            "success": False,
+            "status": 404,
+            "message": "签到接口404，用户信息查询也失败",
+        }
 
     def _handle_other_response(self, response: httpx.Response) -> Dict[str, Any]:
         """处理其他HTTP响应"""
@@ -667,7 +776,11 @@ class CheckIn:
             f"❌ [{self.account.name}] 签到请求失败: HTTP {response.status_code}"
         )
         self.logger.info(f"📄 [{self.account.name}] 响应内容: {response.text[:100]}...")
-        return {"success": False, "message": f"HTTP {response.status_code}"}
+        return {
+            "success": False,
+            "status": response.status_code,
+            "message": f"HTTP {response.status_code}",
+        }
 
     async def _do_checkin_in_browser(
         self, page: Page, cookies: Dict[str, str], auth_config: AuthConfig
@@ -697,48 +810,70 @@ class CheckIn:
                 "Accept": headers.get("Accept", "application/json, text/plain, */*"),
                 "Content-Type": "application/json",
             }
-            if "New-Api-User" in headers:
-                headers_dict["New-Api-User"] = headers["New-Api-User"]
+            api_user_header = self.provider.api_user_key or "New-Api-User"
+            if api_user_header in headers:
+                headers_dict[api_user_header] = headers[api_user_header]
                 self.logger.debug(
-                    f"🔑 [{self.account.name}] 浏览器签到包含 New-Api-User: {headers['New-Api-User']}"
+                    f"🔑 [{self.account.name}] 浏览器签到包含 {api_user_header}: "
+                    f"{headers[api_user_header]}"
                 )
 
-            # 使用page.evaluate在浏览器上下文中执行fetch请求
-            result = await page.evaluate(
-                """
-                async ({url, headers}) => {
-                    try {
-                        const response = await fetch(url, {
-                            method: 'POST',
-                            headers: headers,
-                            credentials: 'include'
-                        });
+            async def fetch_once() -> Dict[str, Any]:
+                """执行一次签到 fetch，状态码重试由统一策略处理。"""
+                try:
+                    result = await page.evaluate(
+                        """
+                        async ({url, headers}) => {
+                            try {
+                                const response = await fetch(url, {
+                                    method: 'POST',
+                                    headers: headers,
+                                    credentials: 'include'
+                                });
 
-                        const contentType = response.headers.get('content-type');
-                        let data;
+                                const contentType = response.headers.get('content-type') || '';
+                                let data;
 
-                        if (contentType && contentType.includes('application/json')) {
-                            data = await response.json();
-                        } else {
-                            data = await response.text();
+                                if (contentType.toLowerCase().includes('application/json')) {
+                                    try {
+                                        data = await response.json();
+                                    } catch (parseError) {
+                                        data = await response.text();
+                                    }
+                                } else {
+                                    data = await response.text();
+                                }
+
+                                return {
+                                    status: response.status,
+                                    ok: response.ok,
+                                    contentType,
+                                    retryAfter: response.headers.get('retry-after'),
+                                    data
+                                };
+                            } catch (error) {
+                                return {
+                                    status: 0,
+                                    ok: false,
+                                    error: error.message
+                                };
+                            }
                         }
+                        """,
+                        {"url": checkin_url, "headers": headers_dict},
+                    )
+                    if isinstance(result, dict):
+                        return result
+                    return {"status": 0, "ok": False, "error": "Invalid browser response"}
+                except Exception as e:
+                    return {"status": 0, "ok": False, "error": str(e)}
 
-                        return {
-                            status: response.status,
-                            ok: response.ok,
-                            contentType: contentType,
-                            data: data
-                        };
-                    } catch (error) {
-                        return {
-                            status: 0,
-                            ok: false,
-                            error: error.message
-                        };
-                    }
-                }
-            """,
-                {"url": checkin_url, "headers": headers_dict},
+            # 对 403/429/临时 5xx 使用退避重试；401 保持立即失败。
+            result = await retry_on_status(
+                fetch_once,
+                logger=self.logger,
+                operation_name=f"[{self.account.name}] 签到 API",
+                retry_statuses=(403, 429, 500, 502, 503, 504),
             )
 
             self.logger.info(
@@ -751,14 +886,18 @@ class CheckIn:
                 )
                 return {
                     "success": False,
+                    "status": result.get("status"),
                     "message": f"浏览器请求失败: {result['error']}",
                 }
 
             if not result.get("ok"):
-                self.logger.error(
-                    f"❌ [{self.account.name}] HTTP错误: {result.get('status')}"
-                )
-                return {"success": False, "message": f"HTTP {result.get('status')}"}
+                status = result.get("status")
+                detail = self._response_detail(result.get("data"))
+                message = f"HTTP {status}"
+                if detail:
+                    message += f": {detail}"
+                self.logger.error(f"❌ [{self.account.name}] {message}")
+                return {"success": False, "status": status, "message": message}
 
             # 处理响应数据
             data = result.get("data")
@@ -776,15 +915,10 @@ class CheckIn:
                     self.logger.info(
                         f"📄 [{self.account.name}] 响应片段: {data[:200]}..."
                     )
-
-                    # 等待一下，让JavaScript执行完毕
-                    await page.wait_for_timeout(3000)
-
-                    # 尝试通过检查用户信息来验证签到是否成功
-                    self.logger.info(f"🔍 [{self.account.name}] 尝试验证签到结果...")
                     return {
-                        "success": True,
-                        "message": "签到请求已发送（JavaScript响应），需要验证",
+                        "success": False,
+                        "status": result.get("status"),
+                        "message": f"签到返回非JSON响应 ({content_type or 'unknown content type'})",
                     }
 
                 # 尝试解析JSON字符串
@@ -792,7 +926,11 @@ class CheckIn:
                     data = json.loads(data)
                 except json.JSONDecodeError:
                     self.logger.error(f"❌ [{self.account.name}] 无法解析响应为JSON")
-                    return {"success": False, "message": "响应不是有效的JSON"}
+                    return {
+                        "success": False,
+                        "status": result.get("status"),
+                        "message": "响应不是有效的JSON",
+                    }
 
             if isinstance(data, dict):
                 if data.get("success"):
@@ -803,16 +941,28 @@ class CheckIn:
                 else:
                     error_msg = data.get("message", "签到失败")
                     self.logger.error(f"❌ [{self.account.name}] 签到失败: {error_msg}")
-                    return {"success": False, "message": error_msg}
+                    return {
+                        "success": False,
+                        "status": result.get("status"),
+                        "message": error_msg,
+                    }
 
             self.logger.error(f"❌ [{self.account.name}] 未知响应格式")
-            return {"success": False, "message": "未知响应格式"}
+            return {
+                "success": False,
+                "status": result.get("status"),
+                "message": "未知响应格式",
+            }
 
         except Exception as e:
             self.logger.error(
                 f"❌ [{self.account.name}] 浏览器签到异常: {type(e).__name__}: {str(e)}"
             )
-            return {"success": False, "message": f"浏览器签到异常: {str(e)}"}
+            return {
+                "success": False,
+                "status": 0,
+                "message": f"浏览器签到异常: {str(e)}",
+            }
 
     @performance_monitor
     @retry_async(max_retries=3, delay=2, backoff=2)
@@ -869,7 +1019,28 @@ class CheckIn:
                 headers=headers,
             ) as client:
                 self.logger.info(f"📤 [{self.account.name}] 发送POST请求...")
-                response = await client.post(self.provider.get_checkin_url())
+                async def request_once() -> Dict[str, Any]:
+                    response = await client.post(self.provider.get_checkin_url())
+                    return {
+                        "status": response.status_code,
+                        "ok": response.is_success,
+                        "retry_after": response.headers.get("retry-after"),
+                        "response": response,
+                    }
+
+                request_result = await retry_on_status(
+                    request_once,
+                    logger=self.logger,
+                    operation_name=f"[{self.account.name}] 签到 API",
+                    retry_statuses=(403, 429, 500, 502, 503, 504),
+                )
+                response = request_result.get("response")
+                if response is None:
+                    return {
+                        "success": False,
+                        "status": request_result.get("status"),
+                        "message": request_result.get("error", "请求无有效响应"),
+                    }
 
                 # 处理响应
                 return await self._handle_checkin_response(response, client, headers)
@@ -895,9 +1066,15 @@ class CheckIn:
         api_user = auth_config.api_user
         if not api_user:
             api_user = self._infer_api_user(self.account.name)
-            self.logger.info(
-                f"🔍 [{self.account.name}] 从账号名称推断API User: {api_user}"
-            )
+            if api_user:
+                self.logger.info(
+                    f"🔍 [{self.account.name}] 从账号名称推断 API User: {api_user}"
+                )
+            else:
+                self.logger.warning(
+                    f"⚠️ [{self.account.name}] 未配置可靠的 API User，"
+                    "不会使用账号名伪造请求头"
+                )
 
         headers = self._build_request_headers(api_user)
         headers["X-Requested-With"] = "XMLHttpRequest"
@@ -1006,48 +1183,68 @@ class CheckIn:
                 "Accept": headers.get("Accept", "application/json, text/plain, */*"),
                 "X-Requested-With": "XMLHttpRequest",
             }
-            if "New-Api-User" in headers:
-                headers_dict["New-Api-User"] = headers["New-Api-User"]
+            api_user_header = self.provider.api_user_key or "New-Api-User"
+            if api_user_header in headers:
+                headers_dict[api_user_header] = headers[api_user_header]
                 self.logger.debug(
-                    f"🔑 [{self.account.name}] 浏览器用户信息查询包含 New-Api-User: {headers['New-Api-User']}"
+                    f"🔑 [{self.account.name}] 浏览器用户信息查询包含 {api_user_header}: "
+                    f"{headers[api_user_header]}"
                 )
 
-            # 使用page.evaluate在浏览器上下文中执行fetch请求
-            result = await page.evaluate(
-                """
-                async ({url, headers}) => {
-                    try {
-                        const response = await fetch(url, {
-                            method: 'GET',
-                            headers: headers,
-                            credentials: 'include'
-                        });
+            async def fetch_once() -> Dict[str, Any]:
+                try:
+                    result = await page.evaluate(
+                        """
+                        async ({url, headers}) => {
+                            try {
+                                const response = await fetch(url, {
+                                    method: 'GET',
+                                    headers: headers,
+                                    credentials: 'include'
+                                });
 
-                        const contentType = response.headers.get('content-type');
-                        let data;
+                                const contentType = response.headers.get('content-type') || '';
+                                let data;
 
-                        if (contentType && contentType.includes('application/json')) {
-                            data = await response.json();
-                        } else {
-                            data = await response.text();
+                                if (contentType.toLowerCase().includes('application/json')) {
+                                    try {
+                                        data = await response.json();
+                                    } catch (parseError) {
+                                        data = await response.text();
+                                    }
+                                } else {
+                                    data = await response.text();
+                                }
+
+                                return {
+                                    status: response.status,
+                                    ok: response.ok,
+                                    contentType,
+                                    retryAfter: response.headers.get('retry-after'),
+                                    data
+                                };
+                            } catch (error) {
+                                return {
+                                    status: 0,
+                                    ok: false,
+                                    error: error.message
+                                };
+                            }
                         }
+                        """,
+                        {"url": user_info_url, "headers": headers_dict},
+                    )
+                    if isinstance(result, dict):
+                        return result
+                    return {"status": 0, "ok": False, "error": "Invalid browser response"}
+                except Exception as e:
+                    return {"status": 0, "ok": False, "error": str(e)}
 
-                        return {
-                            status: response.status,
-                            ok: response.ok,
-                            contentType: contentType,
-                            data: data
-                        };
-                    } catch (error) {
-                        return {
-                            status: 0,
-                            ok: false,
-                            error: error.message
-                        };
-                    }
-                }
-            """,
-                {"url": user_info_url, "headers": headers_dict},
+            result = await retry_on_status(
+                fetch_once,
+                logger=self.logger,
+                operation_name=f"[{self.account.name}] 用户信息 API",
+                retry_statuses=(403, 429, 500, 502, 503, 504),
             )
 
             self.logger.info(
@@ -1061,9 +1258,12 @@ class CheckIn:
                 return None
 
             if not result.get("ok"):
-                self.logger.error(
-                    f"❌ [{self.account.name}] HTTP错误: {result.get('status')}"
-                )
+                status = result.get("status")
+                detail = self._response_detail(result.get("data"))
+                message = f"HTTP {status}"
+                if detail:
+                    message += f": {detail}"
+                self.logger.error(f"❌ [{self.account.name}] {message}")
                 return None
 
             # 处理响应数据
@@ -1148,7 +1348,24 @@ class CheckIn:
                 follow_redirects=True,
                 headers=headers,
             ) as client:
-                response = await client.get(self.provider.get_user_info_url())
+                async def request_once() -> Dict[str, Any]:
+                    response = await client.get(self.provider.get_user_info_url())
+                    return {
+                        "status": response.status_code,
+                        "ok": response.is_success,
+                        "retry_after": response.headers.get("retry-after"),
+                        "response": response,
+                    }
+
+                request_result = await retry_on_status(
+                    request_once,
+                    logger=self.logger,
+                    operation_name=f"[{self.account.name}] 用户信息 API",
+                    retry_statuses=(403, 429, 500, 502, 503, 504),
+                )
+                response = request_result.get("response")
+                if response is None:
+                    return None
                 return await self._handle_user_info_response(response)
 
         except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError) as e:
@@ -1228,13 +1445,10 @@ class CheckIn:
             self.logger.warning(f"⚠️ 保存余额数据失败: {str(e)}")
 
     def _infer_api_user(self, account_name: str) -> Optional[str]:
-        """从账号名称推断API User"""
+        """从账号名称推断 API User（仅接受无歧义的数字后缀）。"""
         import re
 
-        # 尝试从账号名称提取数字ID
-        numbers = re.findall(r"\d+", account_name)
-        if numbers:
-            return numbers[0]  # 使用第一个找到的数字
-        else:
-            # 使用账号名称作为备用方案
-            return account_name.replace("-", "_").replace(".", "")
+        # 账号显示名通常不是站内用户 ID。兼容 linuxdo_84404 这类旧配置，
+        # 但不再把 zj、zx2021 等别名/年份误当成 API User。
+        match = re.search(r"(?:^|[_-])(\d{5,})$", str(account_name or "").strip())
+        return match.group(1) if match else None

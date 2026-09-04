@@ -2,19 +2,19 @@
 邮箱密码认证器 - 使用用户名和密码进行表单登录
 """
 
-from typing import Dict, Any, Optional, Tuple
-from playwright.async_api import Page, BrowserContext
+from typing import Any, Dict, Optional, Tuple
+
+from playwright.async_api import BrowserContext, Page
 
 from utils.auth.base import Authenticator, logger
-from utils.sanitizer import sanitize_exception
-from utils.session_cache import SessionCache
 from utils.constants import (
     EMAIL_INPUT_SELECTORS,
-    PASSWORD_INPUT_SELECTORS,
     LOGIN_BUTTON_SELECTORS,
     POPUP_CLOSE_SELECTORS,
     TimeoutConfig,
 )
+from utils.sanitizer import sanitize_exception
+from utils.session_cache import SessionCache
 
 # 会话缓存实例
 session_cache = SessionCache()
@@ -35,9 +35,9 @@ class EmailAuthenticator(Authenticator):
                         await close_btn.click()
                         await page.wait_for_timeout(TimeoutConfig.VERY_SHORT_WAIT)
                         break
-                except:
+                except Exception:
                     continue
-        except:
+        except Exception:
             pass
 
     async def _find_and_click_email_tab(self, page: Page) -> bool:
@@ -47,7 +47,7 @@ class EmailAuthenticator(Authenticator):
         # 等待页面交互元素就绪
         try:
             await page.wait_for_timeout(1500)
-        except:
+        except Exception:
             pass
 
         for sel in [
@@ -65,7 +65,7 @@ class EmailAuthenticator(Authenticator):
                     await el.click()
                     await page.wait_for_timeout(800)
                     return True
-            except:
+            except Exception:
                 continue
         return False
 
@@ -79,7 +79,7 @@ class EmailAuthenticator(Authenticator):
                 if email_input:
                     logger.info(f"✅ [{self.auth_config.username}] 找到邮箱输入框: {sel}")
                     return email_input
-            except:
+            except Exception:
                 continue
 
         # 调试信息
@@ -105,7 +105,7 @@ class EmailAuthenticator(Authenticator):
                     inp_name = await inp.get_attribute('name')
                     inp_placeholder = await inp.get_attribute('placeholder')
                     logger.info(f"     输入框{i+1}: type={inp_type}, name={inp_name}, placeholder={inp_placeholder}")
-                except:
+                except Exception:
                     logger.info(f"     输入框{i+1}: 无法获取属性")
         except Exception as e:
             logger.info(f"   调试信息获取失败: {e}")
@@ -117,53 +117,123 @@ class EmailAuthenticator(Authenticator):
                 login_button = await page.query_selector(sel)
                 if login_button:
                     return login_button
-            except:
+            except Exception:
                 continue
         return None
 
-    async def _check_login_success(self, page: Page) -> Tuple[bool, Optional[str]]:
-        """检查登录是否成功"""
+    async def _try_cached_session(
+        self, page: Page, context: BrowserContext
+    ) -> Optional[Dict[str, Any]]:
+        """尝试复用本地会话缓存，缓存失效时立即删除。"""
+        try:
+            cached = session_cache.load(
+                account_name=self.account_name,
+                provider=self.provider_config.name,
+            )
+            if not cached or not cached.get("cookies"):
+                return None
+
+            logger.info(f"♻️ [{self.auth_config.username}] 尝试复用会话缓存...")
+            await context.add_cookies(cached["cookies"])
+            await page.goto(
+                f"{self.provider_config.base_url}/panel",
+                wait_until="domcontentloaded",
+                timeout=TimeoutConfig.PAGE_LOAD,
+            )
+            await page.wait_for_timeout(TimeoutConfig.SHORT_WAIT_2)
+
+            api_user = cached.get("user_id") or self.auth_config.api_user
+            validation = await self._validate_authenticated_session(
+                page, context, api_user
+            )
+            if validation.get("success"):
+                logger.info(f"✅ [{self.auth_config.username}] 会话缓存验证成功")
+                return {
+                    "success": True,
+                    "cookies": validation.get("cookies", {}),
+                    "user_id": validation.get("user_id") or cached.get("user_id"),
+                    "username": validation.get("username") or cached.get("username"),
+                }
+
+            logger.warning(
+                f"⚠️ [{self.auth_config.username}] 会话缓存已失效，删除后重新登录"
+            )
+            session_cache.delete(self.account_name, self.provider_config.name)
+            try:
+                await context.clear_cookies()
+                await page.goto(
+                    self.provider_config.get_login_url(),
+                    wait_until="domcontentloaded",
+                    timeout=TimeoutConfig.PAGE_LOAD,
+                )
+            except Exception as nav_error:
+                logger.debug(
+                    f"⚠️ [{self.auth_config.username}] 返回登录页失败: {nav_error}"
+                )
+        except Exception as e:
+            # 缓存损坏或无法注入时不阻断正常登录流程。
+            logger.debug(f"⚠️ [{self.auth_config.username}] 复用会话缓存失败: {e}")
+        return None
+
+    async def _check_login_success(
+        self, page: Page, context: BrowserContext
+    ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+        """验证登录是否真正建立了可用会话。
+
+        页面 URL、标题或 CSS 元素都可能在登录失败时保持正常外观；最终以
+        当前浏览器上下文访问用户信息 API 的结果为准。
+        """
         current_url = page.url
         logger.info(f"🔍 [{self.auth_config.username}] 登录后URL: {current_url}")
 
-        # 方法1: 检查URL变化
-        if "login" not in current_url.lower():
-            logger.info(f"✅ [{self.auth_config.username}] URL已变化，登录可能成功")
-            return True, None
-
-        logger.warning(f"⚠️ [{self.auth_config.username}] 仍在登录页面，检查其他登录指标...")
-
-        # 方法2: 检查页面标题
-        try:
-            page_title = await page.title()
-            logger.info(f"🔍 [{self.auth_config.username}] 页面标题: {page_title}")
-            if "login" not in page_title.lower() and "console" in page_title.lower():
-                logger.info(f"✅ [{self.auth_config.username}] 页面标题显示已登录")
-                return True, None
-        except:
-            pass
-
-        # 方法3: 检查用户界面元素
-        try:
-            user_elements = await page.query_selector_all(
-                '[class*="user"], [class*="avatar"], [class*="profile"], button:has-text("退出"), button:has-text("Logout")'
-            )
-            if user_elements:
-                logger.info(f"✅ [{self.auth_config.username}] 找到用户界面元素，登录成功")
-                return True, None
-        except:
-            pass
-
-        # 方法4: 检查错误提示
         error_msg = await self._check_error_messages(page)
         if error_msg:
-            return False, error_msg
+            return False, error_msg, None, None
 
-        # 仍在登录页
         if "login" in current_url.lower():
-            return False, "Login failed - still on login page (may need captcha)"
+            logger.warning(
+                f"⚠️ [{self.auth_config.username}] 仍在登录页面，不能仅凭页面元素判定成功"
+            )
 
-        return True, None
+        # localStorage 中的 ID 是登录后最可靠的候选值；如果配置中显式提供
+        # api_user，则作为没有 localStorage 数据时的备用候选。
+        local_user_id, local_username = await self._extract_user_from_localstorage(page)
+        api_user = local_user_id or self.auth_config.api_user
+        if api_user:
+            logger.info(f"🔑 [{self.auth_config.username}] 使用 API User 验证会话: {api_user}")
+        else:
+            logger.info(f"ℹ️ [{self.auth_config.username}] 未找到 API User，尝试由会话 API 返回用户信息")
+
+        validation = await self._validate_authenticated_session(page, context, api_user)
+
+        # 如果 localStorage 中的值和显式配置不同，允许用显式值再验证一次，
+        # 但绝不从显示名称或邮箱地址猜测用户 ID。
+        if (
+            not validation.get("success")
+            and local_user_id
+            and self.auth_config.api_user
+            and str(local_user_id) != str(self.auth_config.api_user)
+        ):
+            validation = await self._validate_authenticated_session(
+                page, context, self.auth_config.api_user
+            )
+
+        if validation.get("success"):
+            return (
+                True,
+                None,
+                validation.get("user_id") or local_user_id,
+                validation.get("username") or local_username,
+            )
+
+        error = validation.get("error") or "登录后会话验证失败"
+        status = validation.get("status")
+        if "login" in page.url.lower():
+            error = f"Login failed - still on login page ({error})"
+        elif status in (401, 403):
+            error = f"登录后用户信息 API 返回 HTTP {status}，会话未建立"
+
+        return False, error, None, None
 
     async def _check_error_messages(self, page: Page) -> Optional[str]:
         """检查错误提示信息"""
@@ -190,19 +260,23 @@ class EmailAuthenticator(Authenticator):
                                 logger.info(f"✅ [{self.auth_config.username}] 检测到成功消息: {error_text}")
                             else:
                                 logger.warning(f"⚠️ [{self.auth_config.username}] 检测到消息: {error_text}")
-                    except:
+                    except Exception:
                         pass
-        except:
+        except Exception:
             pass
         return None
 
     async def authenticate(self, page: Page, context: BrowserContext) -> Dict[str, Any]:
         """使用邮箱密码登录"""
         try:
-            logger.info(f"ℹ️ Starting Email authentication")
+            logger.info("ℹ️ Starting Email authentication")
 
             if not await self._init_page_and_check_cloudflare(page):
                 return {"success": False, "error": "Cloudflare verification timeout"}
+
+            cached_result = await self._try_cached_session(page, context)
+            if cached_result:
+                return cached_result
 
             await self._close_popups(page)
             await self._find_and_click_email_tab(page)
@@ -235,23 +309,19 @@ class EmailAuthenticator(Authenticator):
             except Exception:
                 logger.warning(f"⚠️ [{self.auth_config.username}] 页面加载超时，继续检查登录状态...")
 
-            success, error_msg = await self._check_login_success(page)
+            success, error_msg, user_id, username = await self._check_login_success(
+                page, context
+            )
             if not success:
                 return {"success": False, "error": error_msg}
 
             final_cookies = await context.cookies()
             cookies_dict = {cookie["name"]: cookie["value"] for cookie in final_cookies}
 
-            if "session" not in cookies_dict and "sessionid" not in cookies_dict:
+            if not self._has_authenticated_cookie(cookies_dict):
                 logger.warning(f"⚠️ [{self.auth_config.username}] 未找到session cookie")
 
             logger.info(f"✅ [{self.auth_config.username}] 邮箱认证完成，获取到 {len(cookies_dict)} 个cookies")
-
-            # 优先从localStorage提取用户ID，失败则尝试API
-            user_id, username = await self._extract_user_from_localstorage(page)
-            if not user_id:
-                logger.info(f"ℹ️ [{self.auth_config.username}] localStorage未获取到用户ID，尝试API")
-                user_id, username = await self._extract_user_info(page, cookies_dict)
 
             # 保存会话缓存
             try:
